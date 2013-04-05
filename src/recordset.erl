@@ -194,7 +194,7 @@ add_1(Term, IdentityFun, SortFun, [H | Set] = FullSet) ->
         true ->
             case IdentityFun(Term, H) of
                 true ->
-                    FullSet;
+                    [Term | Set];
                 false ->
                     [Term | FullSet]
             end;
