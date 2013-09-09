@@ -63,6 +63,13 @@
 %%   can be given a <code>max_size</code>, and once more than
 %%   <code>max_size</code> items are added to the set items which sort lowest
 %%   based on the supplied <code>SortFun</code> will be removed.
+%%   Sometimes it may be desirable to place a guard before removing an element,
+%%   in such case a <code>trunc_guard</code> option can be provided. It assumes
+%%   that only the smallest element should be checked and if it fails to pass
+%%   the guard check the list will grow above the max_size limit.
+%%   To support the <code>update</code> procedure a <code>find_function</code>
+%%   should be provided which will allow to find an element to which the update
+%%   function should be applied.
 %%
 %% </p></li>
 %% </ol>
@@ -80,18 +87,24 @@
           max_size :: undefined | pos_integer(),
           identity_function :: cmp_fun(),
           sort_function :: cmp_fun(),
-          set = [] :: list()
+          find_function :: find_fun(),
+          truncate_guard_function :: tr_guard_fun(),
+          set = [] :: list() | purged
          }).
 
 -opaque recordset() :: #recordset{}.
--type cmp_fun() :: {fun((term(), term()) -> boolean())}.
+-type cmp_fun() :: fun((term(), term()) -> boolean()).
+-type upd_fun() :: fun((term()) -> boolean()).
+-type find_fun() :: fun((term(), list()) -> term() | false).
+-type tr_guard_fun() :: fun((term()) -> boolean()).
 -type option() :: {atom(), term()}.
 -type op() :: statebox:op().
 
 -export([new/2, new/3]).
 -export([from_list/2, from_list/4, to_list/1]).
 -export([is_recordset/1, size/1, max_size/1]).
--export([add/2, delete/2]).
+-export([add/2, delete/2, update/3, update/4]).
+-export([set_update/4, set_update/5, set_purge/2, set_to_list/1]).
 -export([statebox_add/1, statebox_delete/1]).
 
 %% @equiv new(IdentityFun, SortFun, [])
@@ -105,13 +118,25 @@ new(IdentityFun, SortFun) ->
 %%  <dt><code>max_size</code></dt>
 %%  <dd>Specifies the maximum number of elements that will exist in the set.
 %%  </dd>
+%%  <dt><code>find_fun</code></dt>
+%%  <dd>A function to find an element meeting the specified constrain.
+%%  </dd>
+%%  <dt><code>trunc_guard</code></dt>
+%%  <dd>A function to check if an element can be removed from the list
+%%      during truncate.
+%%  </dd>
 %% </dl>
 -spec new(cmp_fun(), cmp_fun(), [option()]) -> recordset().
 new(IdentityFun, SortFun, Options) ->
     #recordset{max_size=proplists:get_value(max_size, Options),
                identity_function=IdentityFun,
-               sort_function=SortFun}.
-
+               sort_function=SortFun,
+               find_function=proplists:get_value(find_fun,
+                                                 Options,
+                                                 undefined),
+               truncate_guard_function=proplists:get_value(trunc_guard,
+                                                           Options,
+                                                           undefined)}.
 
 %% @doc Return <code>true</code> if the argument is a <code>recordset</code>,
 %%      <code>false</code> otherwise.
@@ -168,22 +193,30 @@ max_size(#recordset{max_size=MaxSize}) ->
 %% element will be removed.
 %%
 %% If the <code>recordset</code> is not fixed-sized then <code>Term</code>
-%% will be added to the set as long as <code>IdentityFun</code> does not
-%% determine that is the same as an existing element and <code>SortFun</code>
-%% does not determine that it is smaller than the existing element with the
-%% same identity.
+%% will be added to the set.
+%%
+%% If an element with the same identity exists in the list it's going to be
+%% replaced with the new one.
 -spec add(term(), recordset()) -> recordset().
+add(_Term, RecordSet = #recordset{set = purged}) ->
+    RecordSet;
 add(Term, RecordSet = #recordset{set=[]}) ->
     RecordSet#recordset{set=[Term]};
-add(Term, RecordSet = #recordset{
-            max_size=MaxSize,
-            identity_function=IdentityFun,
-            sort_function=SortFun,
-            set=Set}) ->
+add(Term, RecordSet0) ->
+
+    RecordSet = delete(Term, RecordSet0),
+
+    #recordset{
+       max_size=MaxSize,
+       identity_function=IdentityFun,
+       sort_function=SortFun,
+       truncate_guard_function=TrGuardFun,
+       set=Set} = RecordSet,
+
     Set1 = case add_1(Term, IdentityFun, SortFun, Set) of
                Set0 when is_integer(MaxSize),
                          length(Set0) > MaxSize ->
-                   truncate(Set0, length(Set0) - MaxSize);
+                   truncate(TrGuardFun, Set0, length(Set0) - MaxSize);
                Set0 ->
                    Set0
            end,
@@ -209,22 +242,39 @@ add_1(Term, IdentityFun, SortFun, [H | Set] = FullSet) ->
 add_1(Term, _IdentityFun, _SortFun, []) ->
     [Term].
 
-truncate(S, 0) ->
+truncate(_GuardF, S, 0) ->
     S;
-truncate([_H | Set], I) ->
-    truncate(Set, I-1).
+truncate(GuardF, [H | Set] = FullSet, I)
+  when is_function(GuardF) ->
+    case GuardF(H) of
+        true ->
+            FullSet;
+        _    ->
+            truncate(GuardF, Set, I-1)
+    end;
+truncate(undefined, [_H | Set], I) ->
+    truncate(undefined, Set, I-1).
+
 
 
 %% @doc Remove an element from the <code>recordset</code>.
 -spec delete(term(), recordset()) -> recordset().
+delete(_Term, RecordSet = #recordset{set = purged}) ->
+    RecordSet;
 delete(_Term, RecordSet = #recordset{set=[]}) ->
     RecordSet;
 delete(Term, RecordSet = #recordset{
-               identity_function=IdentityFun,
-               set=Set}) ->
+                            identity_function=IdentityFun,
+                            set=Set}) ->
     RecordSet#recordset{set=delete_1(Term, IdentityFun, Set)}.
 
-
+delete_1(Term, IdentityFun, [H | []]) ->
+    case IdentityFun(Term, H) of
+        true ->
+            [];
+        false ->
+            [H]
+    end;
 delete_1(Term, IdentityFun, [H | Set]) ->
     case IdentityFun(Term, H) of
         true ->
@@ -246,3 +296,68 @@ statebox_add(Term) ->
 -spec statebox_delete(term()) -> op().
 statebox_delete(Term) ->
     {fun ?MODULE:delete/2, [Term]}.
+
+-spec set_update(
+        UpdateKey  :: term(),
+        UpdateF    :: upd_fun(),
+        DefaultVal :: term(),
+        Set        :: list() | purged,
+        RecordSet  :: recordset()) ->
+                        Set :: list() | purged.
+
+set_update(UpdateKey,  UpdateFun, Set, RecordSet) ->
+    set_update(UpdateKey, UpdateFun, undefined, Set, RecordSet).
+
+set_update(_UpdateKey,  _UpdateFun, _DefaultVal,
+           purged, _RecordSet) ->
+    purged;
+set_update(UpdateKey,  UpdateFun, DefaultVal, Set, RecordSet)
+  when is_list(Set) ->
+    UpdatedRecordSet =
+        update(UpdateKey, UpdateFun, DefaultVal,
+               RecordSet#recordset{set = Set}),
+    UpdatedRecordSet#recordset.set.
+
+
+-spec set_purge(
+        Set       :: list() | purged,
+        RecordSet :: recordset()) -> purged.
+
+set_purge(_Set, _RecordSet) -> purged.
+
+-spec set_to_list(
+        Set :: list() | purged) ->
+                         List :: list().
+
+set_to_list(Set) when is_list(Set) -> Set;
+set_to_list(_) -> [].
+
+-spec update(
+        UpdateKey  :: term(),
+        UpdateF    :: upd_fun(),
+        DefaultVal :: term(),
+        RecordSet  :: recordset()) ->
+                    RecordSet :: recordset().
+
+update(UpdateKey, UpdateF, RecordSet) ->
+    update(UpdateKey, UpdateF, undefined, RecordSet).
+
+update(_UpdateKey, _UpdateF, _DefaultVal,
+       RecordSet = #recordset{set = purged}) ->
+    RecordSet;
+update(UpdateKey, UpdateF, DefaultVal,
+       RecordSet=#recordset{find_function=FindFun})
+  when is_function(FindFun) ->
+    MaybeNewRecord =
+        case FindFun(UpdateKey, RecordSet#recordset.set) of
+            {ok, Record} -> UpdateF(Record);
+            _ -> DefaultVal
+        end,
+
+    case MaybeNewRecord of
+        undefined -> RecordSet;
+        NewRecord -> recordset:add(NewRecord, RecordSet)
+    end;
+update(_UpdateKey, _UpdateF, _DefaultVal, RecordSet) ->
+    RecordSet.
+
